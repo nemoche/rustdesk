@@ -14,6 +14,8 @@ use magnum_opus::{Channels::*, Decoder as AudioDecoder};
 #[cfg(not(target_os = "linux"))]
 use ringbuf::{ring_buffer::RbBase, Rb};
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "linux"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::HashMap,
     ffi::c_void,
@@ -1189,11 +1191,17 @@ pub struct AudioHandler {
     sample_rate: (u32, u32),
     #[cfg(not(target_os = "linux"))]
     audio_stream: Option<Box<dyn StreamTrait>>,
+    #[cfg(not(target_os = "linux"))]
+    audio_format: Option<AudioFormat>,
     channels: u16,
     #[cfg(not(target_os = "linux"))]
     device_channel: u16,
     #[cfg(not(target_os = "linux"))]
     ready: Arc<std::sync::Mutex<bool>>,
+    #[cfg(not(target_os = "linux"))]
+    restart_required: Arc<AtomicBool>,
+    #[cfg(not(target_os = "linux"))]
+    last_restart_attempt: Option<Instant>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1226,6 +1234,12 @@ impl AudioBuffer {
             self.1 = sample_rate * channels;
             log::info!("Audio buffer resized from {old_capacity} to {capacity}");
         }
+    }
+
+    fn clear(&self) {
+        let mut lock = self.0.lock().unwrap();
+        let occupied = lock.occupied_len();
+        lock.skip(occupied);
     }
 
     fn try_shrink(&mut self, having: usize) {
@@ -1401,12 +1415,29 @@ impl AudioHandler {
 
     /// Handle audio format and create an audio decoder.
     pub fn handle_format(&mut self, f: AudioFormat) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.audio_format = Some(f.clone());
+        }
         match AudioDecoder::new(f.sample_rate, if f.channels > 1 { Stereo } else { Mono }) {
             Ok(d) => {
                 let buffer = vec![0.; f.sample_rate as usize * f.channels as usize];
                 self.audio_decoder = Some((d, buffer));
                 self.channels = f.channels as _;
-                allow_err!(self.start_audio(f));
+                match self.start_audio(f) {
+                    Ok(()) => {
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            self.restart_required.store(false, Ordering::Release);
+                            self.last_restart_attempt = None;
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("Failed to start audio playback: {err}");
+                        #[cfg(not(target_os = "linux"))]
+                        self.restart_required.store(true, Ordering::Release);
+                    }
+                }
             }
             Err(err) => {
                 log::error!("Failed to create audio decoder: {}", err);
@@ -1418,8 +1449,34 @@ impl AudioHandler {
     #[inline]
     pub fn handle_frame(&mut self, frame: AudioFrame) {
         #[cfg(not(target_os = "linux"))]
-        if self.audio_stream.is_none() || !self.ready.lock().unwrap().clone() {
-            return;
+        {
+            if self.restart_required.load(Ordering::Acquire) {
+                let now = Instant::now();
+                let retry_due = self
+                    .last_restart_attempt
+                    .map(|last| now.duration_since(last) >= Duration::from_secs(1))
+                    .unwrap_or(true);
+                if retry_due {
+                    self.last_restart_attempt = Some(now);
+                    self.audio_stream = None;
+                    *self.ready.lock().unwrap() = false;
+                    self.audio_buffer.clear();
+                    if let Some(format) = self.audio_format.clone() {
+                        match self.start_audio(format) {
+                            Ok(()) => {
+                                log::info!("Audio playback recovered on the current output device");
+                                self.restart_required.store(false, Ordering::Release);
+                            }
+                            Err(err) => {
+                                log::warn!("Failed to recover audio playback: {err}");
+                            }
+                        }
+                    }
+                }
+            }
+            if self.audio_stream.is_none() || !*self.ready.lock().unwrap() {
+                return;
+            }
         }
         #[cfg(target_os = "linux")]
         if self.simple.is_none() {
@@ -1472,9 +1529,12 @@ impl AudioHandler {
         device: &Device,
     ) -> ResultType<()> {
         self.device_channel = config.channels;
+        let ready = self.ready.clone();
+        let restart_required = self.restart_required.clone();
         let err_fn = move |err| {
-            // too many errors, will improve later
-            log::trace!("an error occurred on stream: {}", err);
+            log::warn!("Audio output stream failed and will be restarted: {err}");
+            *ready.lock().unwrap() = false;
+            restart_required.store(true, Ordering::Release);
         };
         self.audio_buffer
             .resize(config.sample_rate.0 as _, config.channels as _);
@@ -4325,3 +4385,4 @@ async fn udp_nat_connect(
         })?;
     Ok((res.1, Some(res.0), typ))
 }
+
