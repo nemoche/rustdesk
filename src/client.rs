@@ -28,6 +28,21 @@ use std::{
     },
 };
 use uuid::Uuid;
+#[cfg(target_os = "windows")]
+use windows::{
+    core::{implement, PCWSTR},
+    Win32::{
+        Foundation::{PROPERTYKEY, RPC_E_CHANGED_MODE},
+        Media::Audio::{
+            eConsole, eRender, EDataFlow, ERole, IMMDeviceEnumerator, IMMNotificationClient,
+            IMMNotificationClient_Impl, DEVICE_STATE, MMDeviceEnumerator,
+        },
+        System::Com::{
+            CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL,
+            COINIT_APARTMENTTHREADED,
+        },
+    },
+};
 
 use crate::{
     check_port,
@@ -1180,6 +1195,102 @@ impl ClientClipboardHandler {
     }
 }
 
+#[cfg(target_os = "windows")]
+#[implement(IMMNotificationClient)]
+struct AudioEndpointNotification {
+    restart_required: Arc<AtomicBool>,
+}
+
+#[cfg(target_os = "windows")]
+impl IMMNotificationClient_Impl for AudioEndpointNotification_Impl {
+    fn OnDeviceStateChanged(
+        &self,
+        _device_id: &PCWSTR,
+        _new_state: DEVICE_STATE,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnDeviceAdded(&self, _device_id: &PCWSTR) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnDeviceRemoved(&self, _device_id: &PCWSTR) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnDefaultDeviceChanged(
+        &self,
+        flow: EDataFlow,
+        role: ERole,
+        _default_device_id: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        if flow == eRender && role == eConsole {
+            self.restart_required.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    fn OnPropertyValueChanged(
+        &self,
+        _device_id: &PCWSTR,
+        _key: &PROPERTYKEY,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct AudioEndpointNotificationRegistration {
+    enumerator: IMMDeviceEnumerator,
+    client: IMMNotificationClient,
+    uninitialize_com: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl AudioEndpointNotificationRegistration {
+    fn new(restart_required: Arc<AtomicBool>) -> windows::core::Result<Self> {
+        let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if result.is_err() && result != RPC_E_CHANGED_MODE {
+            return Err(windows::core::Error::from_hresult(result));
+        }
+        let uninitialize_com = result.is_ok();
+        let registration = (|| {
+            let enumerator: IMMDeviceEnumerator =
+                unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+            let client: IMMNotificationClient = AudioEndpointNotification {
+                restart_required,
+            }
+            .into();
+            unsafe { enumerator.RegisterEndpointNotificationCallback(&client)? };
+            Ok(Self {
+                enumerator,
+                client,
+                uninitialize_com,
+            })
+        })();
+        if registration.is_err() && uninitialize_com {
+            unsafe { CoUninitialize() };
+        }
+        registration
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for AudioEndpointNotificationRegistration {
+    fn drop(&mut self) {
+        if let Err(err) = unsafe {
+            self.enumerator
+                .UnregisterEndpointNotificationCallback(&self.client)
+        } {
+            log::warn!("Failed to unregister the audio endpoint notification callback: {err}");
+        }
+        if self.uninitialize_com {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
 /// Audio handler for the [`Client`].
 #[derive(Default)]
 pub struct AudioHandler {
@@ -1193,6 +1304,8 @@ pub struct AudioHandler {
     audio_stream: Option<Box<dyn StreamTrait>>,
     #[cfg(not(target_os = "linux"))]
     audio_format: Option<AudioFormat>,
+    #[cfg(target_os = "windows")]
+    audio_endpoint_notification: Option<AudioEndpointNotificationRegistration>,
     channels: u16,
     #[cfg(not(target_os = "linux"))]
     device_channel: u16,
@@ -1368,10 +1481,8 @@ impl AudioHandler {
         let device = AUDIO_HOST
             .default_output_device()
             .with_context(|| "Failed to get default output device")?;
-        log::info!(
-            "Using default output device: \"{}\"",
-            device.name().unwrap_or("".to_owned())
-        );
+        let device_name = device.name().unwrap_or_default();
+        log::info!("Using default output device: \"{device_name}\"");
         let config = device.default_output_config().map_err(|e| anyhow!(e))?;
         let sample_format = config.sample_format();
         log::info!("Default output format: {:?}", config);
@@ -1409,6 +1520,20 @@ impl AudioHandler {
         } else {
             build_output_stream(config)?;
         }
+        drop(build_output_stream);
+
+        #[cfg(target_os = "windows")]
+        if self.audio_endpoint_notification.is_none() {
+            match AudioEndpointNotificationRegistration::new(self.restart_required.clone()) {
+                Ok(registration) => {
+                    self.audio_endpoint_notification = Some(registration);
+                    log::info!("Registered for Windows default audio output change events");
+                }
+                Err(err) => {
+                    log::warn!("Failed to register for audio output change events: {err}");
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1424,11 +1549,12 @@ impl AudioHandler {
                 let buffer = vec![0.; f.sample_rate as usize * f.channels as usize];
                 self.audio_decoder = Some((d, buffer));
                 self.channels = f.channels as _;
+                #[cfg(not(target_os = "linux"))]
+                self.restart_required.store(false, Ordering::Release);
                 match self.start_audio(f) {
                     Ok(()) => {
                         #[cfg(not(target_os = "linux"))]
                         {
-                            self.restart_required.store(false, Ordering::Release);
                             self.last_restart_attempt = None;
                         }
                     }
@@ -1450,13 +1576,13 @@ impl AudioHandler {
     pub fn handle_frame(&mut self, frame: AudioFrame) {
         #[cfg(not(target_os = "linux"))]
         {
+            let now = Instant::now();
             if self.restart_required.load(Ordering::Acquire) {
-                let now = Instant::now();
                 let retry_due = self
                     .last_restart_attempt
                     .map(|last| now.duration_since(last) >= Duration::from_secs(1))
                     .unwrap_or(true);
-                if retry_due {
+                if retry_due && self.restart_required.swap(false, Ordering::AcqRel) {
                     self.last_restart_attempt = Some(now);
                     self.audio_stream = None;
                     *self.ready.lock().unwrap() = false;
@@ -1465,10 +1591,11 @@ impl AudioHandler {
                         match self.start_audio(format) {
                             Ok(()) => {
                                 log::info!("Audio playback recovered on the current output device");
-                                self.restart_required.store(false, Ordering::Release);
+                                self.last_restart_attempt = None;
                             }
                             Err(err) => {
                                 log::warn!("Failed to recover audio playback: {err}");
+                                self.restart_required.store(true, Ordering::Release);
                             }
                         }
                     }
