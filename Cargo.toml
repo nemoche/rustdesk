@@ -120,10 +120,12 @@ winapi = { version = "0.3", features = [
 windows = { version = "0.61", features = [
     "Win32",
     "Win32_Foundation",
+    "Win32_Media_Audio",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System",
+    "Win32_System_Com",
     "Win32_System_Diagnostics",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Environment",
@@ -245,3 +247,4 @@ rpath = true
 
 [profile.dev]
 debug = 1
+
